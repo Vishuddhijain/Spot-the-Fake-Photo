@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Spot the Fake Photo — Live Demo</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0f1117; color:#eee; text-align:center; padding:24px; }
+  video, canvas { border-radius:12px; max-width:90vw; }
+  #score { font-size:48px; font-weight:700; margin:16px 0; }
+  #label { font-size:20px; margin-bottom:8px; }
+  .real { color:#4ade80; }
+  .screen { color:#f87171; }
+  .bar-wrap { width:320px; max-width:80vw; height:14px; background:#222; border-radius:7px; margin:12px auto; overflow:hidden; }
+  .bar { height:100%; background:linear-gradient(90deg,#4ade80,#f87171); width:0%; transition:width .15s; }
+  small { color:#888; display:block; margin-top:20px; max-width:480px; margin-left:auto; margin-right:auto; }
+</style>
+</head>
+<body>
+  <h2>Spot the Fake Photo — Live Demo</h2>
+  <p>Point your camera at a real object, then at a phone/laptop screen showing a photo.</p>
+  <video id="video" autoplay playsinline width="480" height="360"></video>
+  <canvas id="canvas" width="480" height="360" style="display:none;"></canvas>
+  <div id="label">—</div>
+  <div id="score">—</div>
+  <div class="bar-wrap"><div class="bar" id="bar"></div></div>
+  <small>
+    Client-side approximation (specular-highlight + high-frequency-energy + border-line heuristics)
+    running in your browser at ~10fps for a snappy demo. The real, more accurate scoring
+    (including the FFT moiré-peak test) runs in predict.py — this page is a lightweight,
+    illustrative preview of the same idea, not the graded model.
+  </small>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const scoreEl = document.getElementById('score');
+const labelEl = document.getElementById('label');
+const barEl = document.getElementById('bar');
+
+navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+  .then(stream => { video.srcObject = stream; })
+  .catch(err => { labelEl.textContent = 'Camera error: ' + err.message; });
+
+function toGray(imgData) {
+  const { data, width, height } = imgData;
+  const gray = new Float32Array(width * height);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+  }
+  return gray;
+}
+
+// Sobel-based high-frequency energy (proxy for FFT high-freq band)
+function hfEnergy(gray, w, h) {
+  let sum = 0, count = 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const gx = gray[i - 1] - gray[i + 1];
+      const gy = gray[i - w] - gray[i + w];
+      sum += gx * gx + gy * gy;
+      count++;
+    }
+  }
+  return sum / count / 255.0;
+}
+
+// Specular highlight fraction: small hard bright near-white blobs
+function specularFraction(imgData) {
+  const { data, width, height } = imgData;
+  let bright = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    const maxc = Math.max(r, g, b), minc = Math.min(r, g, b);
+    const v = maxc, s = maxc === 0 ? 0 : (maxc - minc) / maxc;
+    if (v > 245 && s < 0.25) bright++;
+  }
+  return bright / (width * height);
+}
+
+// Border line score: strong edge energy concentrated in the outer 12% ring
+function borderScore(gray, w, h) {
+  const m = 0.12;
+  const mx = Math.floor(w * m), my = Math.floor(h * m);
+  let borderEdge = 0, borderCount = 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const nearBorder = x < mx || x > w - mx || y < my || y > h - my;
+      if (!nearBorder) continue;
+      const i = y * w + x;
+      const gx = gray[i - 1] - gray[i + 1];
+      const gy = gray[i - w] - gray[i + w];
+      const mag = Math.sqrt(gx * gx + gy * gy);
+      if (mag > 60) borderEdge++;
+      borderCount++;
+    }
+  }
+  return borderCount ? borderEdge / borderCount : 0;
+}
+
+function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
+
+function tick() {
+  if (video.readyState === video.HAVE_ENOUGH_DATA) {
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const gray = toGray(imgData);
+
+    const hf = hfEnergy(gray, canvas.width, canvas.height);   // natural images: low-ish
+    const spec = specularFraction(imgData);                    // screens: higher
+    const border = borderScore(gray, canvas.width, canvas.height); // screens/printouts: higher
+
+    // hand-tuned linear combo, mirrors predict.py's fallback rule in spirit
+    const z = 3.0 * hf + 8.0 * spec + 4.0 * border - 2.4;
+    const score = sigmoid(z);
+
+    scoreEl.textContent = score.toFixed(2);
+    scoreEl.className = score > 0.5 ? 'screen' : 'real';
+    labelEl.textContent = score > 0.5 ? 'PHOTO OF A SCREEN' : 'REAL PHOTO';
+    labelEl.className = score > 0.5 ? 'screen' : 'real';
+    barEl.style.width = (score * 100).toFixed(0) + '%';
+  }
+  setTimeout(() => requestAnimationFrame(tick), 100); // ~10fps, plenty for a demo
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
